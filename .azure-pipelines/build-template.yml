@@ -10,7 +10,7 @@ parameters:
 - name: pool
   type: string
   values:
-  - sonicso1ES-amd64
+  - justForTesting
   - sonicso1ES-armhf
   - sonicso1ES-arm64
   - default

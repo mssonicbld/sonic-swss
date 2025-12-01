@@ -8,7 +8,7 @@ parameters:
 - name: pool
   type: string
   values:
-  - sonicso1ES-amd64
+  - justForTesting
   - default
   default: default
 
