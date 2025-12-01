@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import io
+import traceback
 
 from typing import Dict, Tuple
 from datetime import datetime
@@ -28,6 +29,10 @@ from dvslib import dvs_mirror
 from dvslib import dvs_policer
 from dvslib import dvs_hash
 from dvslib import dvs_switch
+from dvslib import dvs_twamp
+from dvslib import dvs_buffer
+from dvslib import dvs_queue
+from dvslib import dvs_flex_counter
 
 from buffer_model import enable_dynamic_buffer
 
@@ -38,6 +43,8 @@ NUM_PORTS = 32
 
 # Voq asics will have 16 fabric ports created (defined in Azure/sonic-buildimage#7629).
 FABRIC_NUM_PORTS = 16
+
+SINGLE_ASIC_VOQ_FS = "single_asic_voq_fs"
 
 def ensure_system(cmd):
     rc, output = subprocess.getstatusoutput(cmd)
@@ -101,6 +108,17 @@ def pytest_addoption(parser):
                      default=NUM_PORTS,
                      type=int,
                      help="number of ports")
+
+    parser.addoption("--enable-coverage",
+                     action="store_true",
+                     default=False,
+                     help="Collect the test coverage information")
+
+    parser.addoption("--switch-mode",
+                     action="store",
+                     default=None,
+                     type=str,
+                     help="Set switch mode information")
 
 
 def random_string(size=4, chars=string.ascii_uppercase + string.digits):
@@ -268,6 +286,7 @@ class DockerVirtualSwitch:
     CONFIG_DB_ID = 4
     FLEX_COUNTER_DB_ID = 5
     STATE_DB_ID = 6
+    DPU_APPL_DB_ID = 15
 
     # FIXME: Should be broken up into helper methods in a later PR.
     def __init__(
@@ -283,6 +302,8 @@ class DockerVirtualSwitch:
         newctnname: str = None,
         ctnmounts: Dict[str, str] = None,
         buffer_model: str = None,
+        enable_coverage: bool = False,
+        switch_mode: str = None
     ):
         self.basicd = ["redis-server", "rsyslogd"]
         self.swssd = [
@@ -295,7 +316,7 @@ class DockerVirtualSwitch:
             "portmgrd"
         ]
         self.syncd = ["syncd"]
-        self.rtd = ["fpmsyncd", "zebra", "staticd"]
+        self.rtd = ["fpmsyncd", "zebra", "staticd", "mgmtd"]
         self.teamd = ["teamsyncd", "teammgrd"]
         self.natd = ["natsyncd", "natmgrd"]
         self.alld = self.basicd + self.swssd + self.syncd + self.rtd + self.teamd + self.natd
@@ -304,6 +325,8 @@ class DockerVirtualSwitch:
         self.dvsname = name
         self.vct = vct
         self.ctn = None
+        self.enable_coverage = enable_coverage
+        self.switch_mode = switch_mode
 
         self.cleanup = not keeptb
 
@@ -367,7 +390,11 @@ class DockerVirtualSwitch:
 
         # Dynamically create a DVS container and servers
         else:
-            self.ctn_sw = self.client.containers.run("debian:jessie",
+            if 'DEFAULT_CONTAINER_REGISTRY' in os.environ:
+                cr_prefix = os.environ['DEFAULT_CONTAINER_REGISTRY'].rstrip("/") + "/"
+            else:
+                cr_prefix = ''
+            self.ctn_sw = self.client.containers.run(cr_prefix + "debian:jessie",
                                                      privileged=True,
                                                      detach=True,
                                                      command="bash",
@@ -429,6 +456,7 @@ class DockerVirtualSwitch:
     def reset_dbs(self):
         # DB wrappers are declared here, lazy-loaded in the tests
         self.app_db = None
+        self.dpu_app_db = None
         self.asic_db = None
         self.counters_db = None
         self.config_db = None
@@ -440,9 +468,36 @@ class DockerVirtualSwitch:
         if getattr(self, 'appldb', False):
             del self.appldb
 
+    def collect_coverage(self):
+        if not self.enable_coverage:
+            return
+        try:
+            # Generate the gcda files
+            self.runcmd('killall5 -15')
+            time.sleep(1)
+
+            # Stop the services to reduce the CPU comsuption
+            if self.cleanup:
+                self.runcmd('supervisorctl stop all')
+
+            # Generate the converage info by lcov and copy to the host
+            cmd = f"docker exec {self.ctn.short_id} sh -c 'cd $BUILD_DIR; rm -rf **/.libs ./lib/libSaiRedis*; lcov -c --directory . --no-external --exclude tests --ignore-errors gcov,unused --output-file /tmp/coverage.info && lcov --add-tracefile /tmp/coverage.info -o /tmp/coverage.info; sed -i \"s#SF:$BUILD_DIR/#SF:#\" /tmp/coverage.info; lcov_cobertura /tmp/coverage.info -o /tmp/coverage.xml'"
+            subprocess.getstatusoutput(cmd)
+            cmd = f"docker exec {self.ctn.short_id} sh -c 'cd $BUILD_DIR; find . -name *.gcda -type f   -exec tar -rf /tmp/gcda.tar {{}} \\;'"
+            subprocess.getstatusoutput(cmd)
+            cmd = f"docker cp {self.ctn.short_id}:/tmp/gcda.tar {self.ctn.short_id}.gcda.tar"
+            subprocess.getstatusoutput(cmd)
+            cmd = f"docker cp {self.ctn.short_id}:/tmp/coverage.info {self.ctn.short_id}.coverage.info"
+            subprocess.getstatusoutput(cmd)
+            cmd = f"docker cp {self.ctn.short_id}:/tmp/coverage.xml {self.ctn.short_id}.coverage.xml"
+            subprocess.getstatusoutput(cmd)
+        except:
+            traceback.print_exc()
 
     def destroy(self) -> None:
         self.del_appl_db()
+
+        self.collect_coverage()
 
         # In case persistent dvs was used removed all the extra server link
         # that were created
@@ -451,10 +506,13 @@ class DockerVirtualSwitch:
 
         # persistent and clean-up flag are mutually exclusive
         elif self.cleanup:
-            self.ctn.remove(force=True)
-            self.ctn_sw.remove(force=True)
-            os.system(f"rm -rf {self.mount}")
-            self.destroy_servers()
+            try:
+                self.ctn.remove(force=True)
+                self.ctn_sw.remove(force=True)
+                os.system(f"rm -rf {self.mount}")
+                self.destroy_servers()
+            except docker.errors.NotFound:
+                print("Skipped the container not found error, the container has already removed.")
 
     def destroy_servers(self):
         for s in self.servers:
@@ -474,6 +532,7 @@ class DockerVirtualSwitch:
             # Initialize the databases.
             self.init_asic_db_validator()
             self.init_appl_db_validator()
+            self.init_dpu_appl_db_validator()
             self.reset_dbs()
 
             # Verify that SWSS has finished initializing.
@@ -517,6 +576,9 @@ class DockerVirtualSwitch:
     def init_appl_db_validator(self) -> None:
         self.appldb = ApplDbValidator(self.APPL_DB_ID, self.redis_sock)
 
+    def init_dpu_appl_db_validator(self) -> None:
+        self.dpu_appldb = ApplDbValidator(self.DPU_APPL_DB_ID, self.redis_sock)
+
     def check_swss_ready(self, timeout: int = 300) -> None:
         """Verify that SWSS is ready to receive inputs.
 
@@ -531,7 +593,10 @@ class DockerVirtualSwitch:
         self.get_config_db()
         metadata = self.config_db.get_entry('DEVICE_METADATA|localhost', '')
         if metadata.get('switch_type', 'npu') in ['voq', 'fabric']:
-            num_ports = NUM_PORTS + FABRIC_NUM_PORTS
+            if self.switch_mode and self.switch_mode == SINGLE_ASIC_VOQ_FS:
+                num_ports = NUM_PORTS
+            else:
+                num_ports = NUM_PORTS + FABRIC_NUM_PORTS
 
         # Verify that all ports have been initialized and configured
         app_db = self.get_app_db()
@@ -551,8 +616,9 @@ class DockerVirtualSwitch:
 
         # Verify that fabric ports are monitored in STATE_DB
         if metadata.get('switch_type', 'npu') in ['voq', 'fabric']:
-            self.get_state_db()
-            self.state_db.wait_for_n_keys("FABRIC_PORT_TABLE", FABRIC_NUM_PORTS)
+            if not self.switch_mode or (self.switch_mode and self.switch_mode != SINGLE_ASIC_VOQ_FS):
+                self.get_state_db()
+                self.state_db.wait_for_n_keys("FABRIC_PORT_TABLE", FABRIC_NUM_PORTS)
 
     def net_cleanup(self) -> None:
         """Clean up network, remove extra links."""
@@ -641,7 +707,7 @@ class DockerVirtualSwitch:
         ensure_system(f"rm -rf {log_dir}")
         ensure_system(f"mkdir -p {log_dir}")
 
-        p = subprocess.Popen(["tar", "--no-same-owner", "-C", os.path.join("./", log_dir), "-x"], stdin=subprocess.PIPE)
+        p = subprocess.Popen(["tar", "--no-same-owner", "--exclude", "README", "-C", os.path.join("./", log_dir), "-x"], stdin=subprocess.PIPE)
 
         stream, _ = self.ctn.get_archive("/var/log/")
         for x in stream:
@@ -698,6 +764,21 @@ class DockerVirtualSwitch:
         self.runcmd(['sh', '-c', 'pkill -9 zebra'])
         time.sleep(5)
 
+    def stop_teamsyncd(self):
+        self.runcmd(['sh', '-c', 'pkill -9 teamsyncd'])
+
+        time.sleep(5)
+
+    def start_teamsyncd(self):
+        self.runcmd(['sh', '-c', 'supervisorctl start teamsyncd'])
+
+        time.sleep(5)
+
+    def restart_teammgrd(self):
+        self.runcmd(['sh', '-c', 'supervisorctl restart teammgrd'])
+
+        time.sleep(5)
+
     # deps: warm_reboot
     def start_fpmsyncd(self):
         self.runcmd(['sh', '-c', 'supervisorctl start fpmsyncd'])
@@ -710,9 +791,23 @@ class DockerVirtualSwitch:
         self.runcmd(['sh', '-c', 'pkill -x fpmsyncd'])
         time.sleep(1)
 
+    def disable_fpmsyncd(self):
+        self.runcmd(['sh', '-c', 'supervisorctl stop fpmsyncd'])
+
+        # Let's give fpmsyncd a chance to connect to Zebra.
+        time.sleep(5)
+
     # deps: warm_reboot
     def SubscribeAppDbObject(self, objpfx):
         r = redis.Redis(unix_socket_path=self.redis_sock, db=swsscommon.APPL_DB,
+                        encoding="utf-8", decode_responses=True)
+        pubsub = r.pubsub()
+        pubsub.psubscribe("__keyspace@0__:%s*" % objpfx)
+        return pubsub
+
+    # deps: warm_reboot
+    def SubscribeDpuAppDbObject(self, objpfx):
+        r = redis.Redis(unix_socket_path=self.redis_sock, db=swsscommon.DPU_APPL_DB,
                         encoding="utf-8", decode_responses=True)
         pubsub = r.pubsub()
         pubsub.psubscribe("__keyspace@0__:%s*" % objpfx)
@@ -1055,6 +1150,28 @@ class DockerVirtualSwitch:
         tbl.set(interface, fvs)
         time.sleep(1)
 
+    def get_interface_oper_status(self, interface):
+        _, output = self.runcmd(f"ip --brief address show {interface}")
+        state = output.split()[1]
+        return state
+
+    def get_interface_link_local_ipv6(self, interface, subnet=False):
+        """
+        If subnet is True, the returned address will include the subnet length (e.g., fe80::aa:bbff:fecc:ddee/64)
+        """
+        _, output = self.runcmd(f"ip --brief address show {interface}")
+        ipv6 = output.split()[2]
+        if not subnet:
+            slash = ipv6.find('/')
+            if slash > 0:
+                ipv6 = ipv6[0:slash]
+        return ipv6
+
+    def get_interface_mac(self, interface):
+        _, output = self.runcmd(f"ip --brief link show {interface}")
+        mac = output.split()[2]
+        return mac
+
     # deps: acl, fdb_update, fdb, mirror_port_erspan, vlan, sub port intf
     def add_ip_address(self, interface, ip, vrf_name=None):
         if interface.startswith("PortChannel"):
@@ -1154,6 +1271,7 @@ class DockerVirtualSwitch:
     # policer, port_dpb_vlan, vlan
     def setup_db(self):
         self.pdb = swsscommon.DBConnector(swsscommon.APPL_DB, self.redis_sock, 0)
+        self.ddb = swsscommon.DBConnector(swsscommon.DPU_APPL_DB, self.redis_sock, 0)
         self.adb = swsscommon.DBConnector(swsscommon.ASIC_DB, self.redis_sock, 0)
         self.cdb = swsscommon.DBConnector(swsscommon.CONFIG_DB, self.redis_sock, 0)
         self.sdb = swsscommon.DBConnector(swsscommon.STATE_DB, self.redis_sock, 0)
@@ -1311,6 +1429,11 @@ class DockerVirtualSwitch:
         tbl.set(interface, fvs)
         time.sleep(1)
 
+    # db
+    def delete_entry_tbl(self, db, table, key):
+        tbl = swsscommon.Table(db, table)
+        tbl._del(key)
+
     # deps: acl, crm, fdb
     def setReadOnlyAttr(self, obj, attr, val):
         db = swsscommon.DBConnector(swsscommon.ASIC_DB, self.redis_sock, 0)
@@ -1342,6 +1465,12 @@ class DockerVirtualSwitch:
             self.app_db = DVSDatabase(self.APPL_DB_ID, self.redis_sock)
 
         return self.app_db
+
+    def get_dpu_app_db(self) -> ApplDbValidator:
+        if not self.dpu_app_db:
+            self.dpu_app_db = DVSDatabase(self.DPU_APPL_DB_ID, self.redis_sock)
+
+        return self.dpu_app_db
 
     # FIXME: Now that AsicDbValidator is using DVSDatabase we should converge this with
     # that implementation. Save it for a follow-up PR.
@@ -1400,7 +1529,8 @@ class DockerVirtualChassisTopology:
         log_path=None,
         max_cpu=2,
         forcedvs=None,
-        topoFile=None
+        topoFile=None,
+        enable_coverage=False,
     ):
         self.ns = namespace
         self.chassbr = "br4chs"
@@ -1414,6 +1544,7 @@ class DockerVirtualChassisTopology:
         self.log_path = log_path
         self.max_cpu = max_cpu
         self.forcedvs = forcedvs
+        self.enable_coverage = enable_coverage
 
         if self.ns is None:
             self.ns = random_string()
@@ -1466,7 +1597,7 @@ class DockerVirtualChassisTopology:
                 self.dvss[ctn.name] = DockerVirtualSwitch(ctn.name, self.imgname, self.keeptb,
                                                           self.env, log_path=ctn.name,
                                                           max_cpu=self.max_cpu, forcedvs=self.forcedvs,
-                                                          vct=self)
+                                                          vct=self, enable_coverage=self.enable_coverage)
         if self.chassbr is None and len(self.dvss) > 0:
             ret, res = self.ctn_runcmd(self.dvss.values()[0].ctn,
                                        "sonic-cfggen --print-data -j /usr/share/sonic/virtual_chassis/vct_connections.json")
@@ -1537,6 +1668,8 @@ class DockerVirtualChassisTopology:
 
     def destroy(self):
         self.verify_vct()
+        for dv in self.dvss.values():
+            dv.collect_coverage()
         if self.keeptb:
             return
         self.oper = "delete"
@@ -1571,6 +1704,11 @@ class DockerVirtualChassisTopology:
             vol = {}
             vol[chassis_config_dir] = {"bind": "/usr/share/sonic/virtual_chassis", "mode": "ro"}
 
+            # Mount database_config.json when connect_to_chassis_db is set to 1
+            if defcfg.get("connect_to_chassis_db") == 1:
+                database_config_file = cwd + "/virtual_chassis/database_config.json"
+                vol[database_config_file] = {"bind": "/etc/sonic/database_config.json", "mode": "ro"}
+
             # pass self.ns into the vs to be use for vs restarts by swss conftest.
             # connection to chassbr is setup by chassis_connect.py within the vs
             data = {}
@@ -1587,7 +1725,8 @@ class DockerVirtualChassisTopology:
                                                          max_cpu=self.max_cpu,
                                                          forcedvs=self.forcedvs,
                                                          vct=self,newctnname=ctnname,
-                                                         ctnmounts=vol)
+                                                         ctnmounts=vol,
+                                                         enable_coverage=self.enable_coverage)
             self.set_ctninfo(ctndir, ctnname, self.dvss[ctnname].pid)
         return
 
@@ -1759,6 +1898,8 @@ def manage_dvs(request) -> str:
     buffer_model = request.config.getoption("--buffer_model")
     force_recreate = request.config.getoption("--force-recreate-dvs")
     graceful_stop = request.config.getoption("--graceful-stop")
+    enable_coverage = request.config.getoption("--enable-coverage")
+    switch_mode = request.config.getoption("--switch-mode")
 
     dvs = None
     curr_dvs_env = [] # lgtm[py/unused-local-variable]
@@ -1790,7 +1931,13 @@ def manage_dvs(request) -> str:
                 dvs.get_logs()
                 dvs.destroy()
 
-            dvs = DockerVirtualSwitch(name, imgname, keeptb, new_dvs_env, log_path, max_cpu, forcedvs, buffer_model = buffer_model)
+            vol = {}
+            if switch_mode and switch_mode == SINGLE_ASIC_VOQ_FS:
+                cwd = os.getcwd()
+                voq_configs = cwd + "/single_asic_voq_fs"
+                vol[voq_configs] = {"bind": "/usr/share/sonic/single_asic_voq_fs", "mode": "ro"}
+
+            dvs = DockerVirtualSwitch(name, imgname, keeptb, new_dvs_env, log_path, max_cpu, forcedvs, buffer_model = buffer_model, enable_coverage=enable_coverage, ctnmounts=vol, switch_mode=switch_mode)
 
             curr_dvs_env = new_dvs_env
 
@@ -1811,6 +1958,7 @@ def manage_dvs(request) -> str:
     if graceful_stop:
         dvs.stop_swss()
         dvs.stop_syncd()
+
     dvs.get_logs()
     dvs.destroy()
 
@@ -1831,7 +1979,7 @@ def dvs(request, manage_dvs) -> DockerVirtualSwitch:
 
     return manage_dvs(log_path, dvs_env)
 
-@pytest.yield_fixture(scope="module")
+@pytest.fixture(scope="module")
 def vst(request):
     vctns = request.config.getoption("--vctns")
     topo = request.config.getoption("--topo")
@@ -1839,13 +1987,14 @@ def vst(request):
     keeptb = request.config.getoption("--keeptb")
     imgname = request.config.getoption("--imgname")
     max_cpu = request.config.getoption("--max_cpu")
+    enable_coverage = request.config.getoption("--enable-coverage")
     log_path = vctns if vctns else request.module.__name__
     dvs_env = getattr(request.module, "DVS_ENV", [])
     if not topo:
         # use ecmp topology as default
         topo = "virtual_chassis/chassis_supervisor.json"
     vct = DockerVirtualChassisTopology(vctns, imgname, keeptb, dvs_env, log_path, max_cpu,
-                                       forcedvs, topo)
+                                       forcedvs, topo, enable_coverage)
     yield vct
     vct.get_logs(request.module.__name__)
     vct.destroy()
@@ -1858,13 +2007,14 @@ def vct(request):
     keeptb = request.config.getoption("--keeptb")
     imgname = request.config.getoption("--imgname")
     max_cpu = request.config.getoption("--max_cpu")
+    enable_coverage = request.config.getoption("--enable-coverage")
     log_path = vctns if vctns else request.module.__name__
     dvs_env = getattr(request.module, "DVS_ENV", [])
     if not topo:
         # use ecmp topology as default
         topo = "virtual_chassis/chassis_with_ecmp_neighbors.json"
     vct = DockerVirtualChassisTopology(vctns, imgname, keeptb, dvs_env, log_path, max_cpu,
-                                       forcedvs, topo)
+                                       forcedvs, topo, enable_coverage)
     yield vct
     vct.get_logs(request.module.__name__)
     vct.destroy()
@@ -1919,7 +2069,8 @@ def dvs_vlan_manager(request, dvs):
 def dvs_port_manager(request, dvs):
     request.cls.dvs_port = dvs_port.DVSPort(dvs.get_asic_db(),
                                             dvs.get_app_db(),
-                                            dvs.get_config_db())
+                                            dvs.get_config_db(),
+                                            dvs.get_counters_db())
 
 
 @pytest.fixture(scope="class")
@@ -1943,7 +2094,36 @@ def dvs_hash_manager(request, dvs):
 
 @pytest.fixture(scope="class")
 def dvs_switch_manager(request, dvs):
-    request.cls.dvs_switch = dvs_switch.DVSSwitch(dvs.get_asic_db())
+    request.cls.dvs_switch = dvs_switch.DVSSwitch(dvs.get_asic_db(),
+                                                  dvs.get_config_db(),
+                                                  dvs.get_counters_db())
+
+@pytest.fixture(scope="class")
+def dvs_twamp_manager(request, dvs):
+    request.cls.dvs_twamp = dvs_twamp.DVSTwamp(dvs.get_asic_db(),
+                                               dvs.get_config_db(),
+                                               dvs.get_state_db(),
+                                               dvs.get_counters_db(),
+                                               dvs.get_app_db())
+
+@pytest.fixture(scope="class")
+def dvs_buffer_manager(request, dvs):
+    request.cls.dvs_buffer = dvs_buffer.DVSBuffer(dvs.get_asic_db(),
+                                                  dvs.get_app_db(),
+                                                  dvs.get_config_db(),
+                                                  dvs.get_state_db(),
+                                                  dvs.get_counters_db())
+
+@pytest.fixture(scope="class")
+def dvs_queue_manager(request, dvs):
+    request.cls.dvs_queue = dvs_queue.DVSQueue(dvs.get_asic_db(),
+                                               dvs.get_config_db(),
+                                               dvs.get_counters_db())
+
+@pytest.fixture(scope="class")
+def dvs_flex_counter_manager(request, dvs):
+    request.cls.dvs_flex_counter = dvs_flex_counter.DVSFlexCounter(dvs.get_config_db(),
+                                                                   dvs.get_flex_db())
 
 ##################### DPB fixtures ###########################################
 def create_dpb_config_file(dvs):

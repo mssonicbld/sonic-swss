@@ -21,6 +21,9 @@ parameters:
   type: string
   default: '$(BUILD_BRANCH)'
 
+- name: debian_version
+  type: string
+
 - name: artifact_name
   type: string
 
@@ -69,7 +72,7 @@ jobs:
   timeoutInMinutes: ${{ parameters.timeout }}
 
   pool:
-    vmImage: 'ubuntu-20.04'
+    vmImage: 'ubuntu-22.04'
 
   steps:
   - task: DownloadPipelineArtifact@2
@@ -81,6 +84,7 @@ jobs:
       runVersion: 'latestFromBranch'
       runBranch: 'refs/heads/${{ parameters.swss_common_branch }}'
       path: $(Build.ArtifactStagingDirectory)/download
+      allowPartiallySucceededBuilds: true
     displayName: "Download sonic swss common deb packages"
   - task: DownloadPipelineArtifact@2
     inputs:
@@ -90,6 +94,7 @@ jobs:
       artifact: ${{ parameters.sairedis_artifact_name }}
       runVersion: 'latestFromBranch'
       runBranch: 'refs/heads/${{ parameters.sairedis_artifact_branch }}'
+      allowPartiallySucceededBuilds: true
       path: $(Build.ArtifactStagingDirectory)/download/sairedis
       patterns: |
         ${{ parameters.sairedis_artifact_pattern }}/libsaivs_*.deb
@@ -131,6 +136,29 @@ jobs:
       path: $(Build.ArtifactStagingDirectory)/download
       patterns: '**/target/${{ parameters.artifact_name }}.gz'
     displayName: "Download sonic-buildimage ${{ parameters.artifact_name }}"
+  - task: DownloadPipelineArtifact@2
+    inputs:
+      source: specific
+      project: ${{ parameters.buildimage_artifact_project }}
+      pipeline: ${{ parameters.buildimage_artifact_pipeline }}
+      artifact: ${{ parameters.buildimage_artifact_name }}
+      runVersion: 'latestFromBranch'
+      runBranch: 'refs/heads/${{ parameters.buildimage_artifact_branch }}'
+      path: $(Build.ArtifactStagingDirectory)/download
+      patterns: '**/target/debs/${{ parameters.debian_version }}/framework_*.deb'
+    displayName: "Download sonic-buildimage sonic-framework package"
+  - task: DownloadPipelineArtifact@2
+    inputs:
+      source: specific
+      project: build
+      pipeline: sonic-net.sonic-platform-vpp
+      artifact: vpp
+      runVersion: 'latestFromBranch'
+      runBranch: 'refs/heads/main'
+      allowPartiallySucceededBuilds: true
+      path: $(Build.ArtifactStagingDirectory)/download
+    displayName: "Download sonic platform-vpp deb packages"
+    condition: eq('${{ parameters.arch }}', 'amd64')
   - script: |
       set -ex
       echo $(Build.DefinitionName).$(Build.BuildNumber)
@@ -141,12 +169,18 @@ jobs:
 
       find $(Build.ArtifactStagingDirectory)/download/sairedis -name '*.deb' -exec cp "{}" .azure-pipelines/docker-sonic-vs/debs \;
       cp -v $(Build.ArtifactStagingDirectory)/download/*.deb .azure-pipelines/docker-sonic-vs/debs
+      if [ -f $(Build.ArtifactStagingDirectory)/download/coverage.info ]; then
+        cp -v $(Build.ArtifactStagingDirectory)/download/coverage.info $(Build.ArtifactStagingDirectory)/
+        cp -v $(Build.ArtifactStagingDirectory)/download/coverage.xml $(Build.ArtifactStagingDirectory)/
+      fi
 
       pushd .azure-pipelines
+      ls -l docker-sonic-vs/debs
 
-      build_args=""
+      build_dir=$(grep BUILD_DIR $(Build.ArtifactStagingDirectory)/download/build.info | cut -d= -f2)
+      build_args="--build-arg build_dir=$build_dir"
       if [ '${{ parameters.asan }}' == True ]; then
-        build_args="--build-arg need_dbg=y"
+        build_args="$build_args --build-arg need_dbg=y"
       fi
 
       docker build $build_args --no-cache -t docker-sonic-vs:$(Build.DefinitionName).$(Build.BuildNumber).asan-${{ parameters.asan }} docker-sonic-vs

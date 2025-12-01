@@ -1,9 +1,16 @@
 #ifndef SWSS_COPPORCH_H
 #define SWSS_COPPORCH_H
 
+extern "C" {
+#include <saiobject.h>
+#include <saistatus.h>
+#include <saiswitch.h>
+}
+
 #include <map>
 #include <set>
 #include <memory>
+#include <unordered_set>
 #include "dbconnector.h"
 #include "orch.h"
 #include "flex_counter_manager.h"
@@ -46,8 +53,18 @@ struct copp_trap_objects
     sai_hostif_trap_type_t trap_type;
 };
 
+struct policer_object
+{
+    sai_object_id_t policer_id;
+    sai_meter_type_t meter;
+    sai_policer_mode_t mode;
+    sai_policer_color_source_t color;
+
+    policer_object() : policer_id(SAI_NULL_OBJECT_ID) {}
+};
+
 /* TrapGroupPolicerTable: trap group ID, policer ID */
-typedef std::map<sai_object_id_t, sai_object_id_t> TrapGroupPolicerTable;
+typedef std::map<sai_object_id_t, policer_object> TrapGroupPolicerTable;
 /* TrapIdTrapObjectsTable: trap ID, copp trap objects */
 typedef std::map<sai_hostif_trap_type_t, copp_trap_objects> TrapIdTrapObjectsTable;
 /* TrapGroupHostIfMap: trap group ID, host interface ID */
@@ -88,11 +105,14 @@ protected:
     std::map<sai_object_id_t, std::string> m_pendingAddToFlexCntr;
 
     std::shared_ptr<DBConnector> m_counter_db;
-    std::shared_ptr<DBConnector> m_flex_db;
     std::shared_ptr<DBConnector> m_asic_db;
+    std::shared_ptr<DBConnector> m_state_db;
     std::unique_ptr<Table> m_counter_table;
     std::unique_ptr<Table> m_vidToRidTable;
-    std::unique_ptr<ProducerTable> m_flex_counter_group_table;
+    std::unique_ptr<Table> m_trapCapabilityTable;
+    std::unique_ptr<Table> m_trapTable;
+
+    std::unordered_set<sai_hostif_trap_type_t> supported_trap_ids;    
 
     FlexCounterManager m_trap_counter_manager;
 
@@ -104,6 +124,9 @@ protected:
     void initDefaultTrapGroup();
     void initDefaultTrapIds();
     void initTrapRatePlugin();
+    bool isTrapIdSupported(sai_hostif_trap_type_t trap_id) const;
+    void updateTrapOperStatus(sai_hostif_trap_type_t trap_type, const std::string& hw_status);
+    void publishTrapIdsCapability();
 
     task_process_status processCoppRule(Consumer& consumer);
     bool isValidList(std::vector<std::string> &trap_id_list, std::vector<std::string> &all_items) const;
@@ -113,7 +136,7 @@ protected:
     bool createPolicer(std::string trap_group, std::vector<sai_attribute_t> &policer_attribs);
     bool removePolicer(std::string trap_group_name);
 
-    sai_object_id_t getPolicer(std::string trap_group_name);
+    policer_object getPolicer(std::string trap_group_name);
 
     bool createGenetlinkHostIf(std::string trap_group_name, std::vector<sai_attribute_t> &hostif_attribs);
     bool removeGenetlinkHostIf(std::string trap_group_name);
@@ -140,7 +163,7 @@ protected:
 
     bool trapGroupUpdatePolicer (std::string trap_group_name, std::vector<sai_attribute_t> &policer_attribs);
 
-    bool removeTrap(sai_object_id_t hostif_trap_id);
+    bool removeTrap(sai_object_id_t hostif_trap_id, sai_hostif_trap_type_t trap_type);
 
     bool bindTrapCounter(sai_object_id_t hostif_trap_id, sai_hostif_trap_type_t trap_type);
     void unbindTrapCounter(sai_object_id_t hostif_trap_id);

@@ -1,11 +1,11 @@
 #pragma once
 
 #include <map>
+#include <nlohmann/json.hpp>
 #include <set>
 #include <string>
 #include <vector>
 
-#include <nlohmann/json.hpp>
 #include "p4orch/p4orch_util.h"
 #include "return_code.h"
 extern "C"
@@ -243,7 +243,7 @@ struct P4AclTableDefinition
     P4AclTableDefinition(const std::string &acl_table_name, const sai_acl_stage_t stage, const uint32_t priority,
                          const uint32_t size, const std::string &meter_unit, const std::string &counter_unit)
         : acl_table_name(acl_table_name), stage(stage), priority(priority), size(size), meter_unit(meter_unit),
-          counter_unit(counter_unit){};
+          counter_unit(counter_unit) {};
 };
 
 struct P4UserDefinedTrapHostifTableEntry
@@ -251,7 +251,7 @@ struct P4UserDefinedTrapHostifTableEntry
     sai_object_id_t user_defined_trap;
     sai_object_id_t hostif_table_entry;
     P4UserDefinedTrapHostifTableEntry()
-        : user_defined_trap(SAI_NULL_OBJECT_ID), hostif_table_entry(SAI_NULL_OBJECT_ID){};
+        : user_defined_trap(SAI_NULL_OBJECT_ID), hostif_table_entry(SAI_NULL_OBJECT_ID) {};
 };
 
 using acl_rule_attr_lookup_t = std::map<std::string, acl_entry_attr_union_t>;
@@ -324,6 +324,9 @@ using P4AclRuleTables = std::map<std::string, std::map<std::string, P4AclRule>>;
 #define P4_MATCH_SRC_IPV6_WORD3 "SAI_ACL_TABLE_ATTR_FIELD_SRC_IPV6_WORD3"
 #define P4_MATCH_SRC_IPV6_WORD2 "SAI_ACL_TABLE_ATTR_FIELD_SRC_IPV6_WORD2"
 #define P4_MATCH_ROUTE_DST_USER_META "SAI_ACL_TABLE_ATTR_FIELD_ROUTE_DST_USER_META"
+#define P4_MATCH_ACL_USER_META "SAI_ACL_TABLE_ATTR_FIELD_ACL_USER_META"
+#define P4_MATCH_VRF_ID "SAI_ACL_TABLE_ATTR_FIELD_VRF_ID"
+#define P4_MATCH_IPMC_TABLE_HIT "SAI_ACL_TABLE_ATTR_FIELD_IPMC_NPU_META_DST_HIT"
 
 #define P4_ACTION_PACKET_ACTION "SAI_ACL_ENTRY_ATTR_ACTION_PACKET_ACTION"
 #define P4_ACTION_REDIRECT "SAI_ACL_ENTRY_ATTR_ACTION_REDIRECT"
@@ -484,6 +487,9 @@ static const acl_table_attr_lookup_t aclMatchTableAttrLookup = {
     {P4_MATCH_TUNNEL_VNI, SAI_ACL_TABLE_ATTR_FIELD_TUNNEL_VNI},
     {P4_MATCH_IPV6_NEXT_HEADER, SAI_ACL_TABLE_ATTR_FIELD_IPV6_NEXT_HEADER},
     {P4_MATCH_ROUTE_DST_USER_META, SAI_ACL_TABLE_ATTR_FIELD_ROUTE_DST_USER_META},
+    {P4_MATCH_ACL_USER_META, SAI_ACL_TABLE_ATTR_FIELD_ACL_USER_META},
+    {P4_MATCH_VRF_ID, SAI_ACL_TABLE_ATTR_FIELD_VRF_ID},
+    {P4_MATCH_IPMC_TABLE_HIT, SAI_ACL_TABLE_ATTR_FIELD_IPMC_NPU_META_DST_HIT},
 };
 
 static const acl_table_attr_format_lookup_t aclMatchTableAttrFormatLookup = {
@@ -533,6 +539,9 @@ static const acl_table_attr_format_lookup_t aclMatchTableAttrFormatLookup = {
     {SAI_ACL_TABLE_ATTR_FIELD_TUNNEL_VNI, Format::HEX_STRING},
     {SAI_ACL_TABLE_ATTR_FIELD_IPV6_NEXT_HEADER, Format::HEX_STRING},
     {SAI_ACL_TABLE_ATTR_FIELD_ROUTE_DST_USER_META, Format::HEX_STRING},
+    {SAI_ACL_TABLE_ATTR_FIELD_ACL_USER_META, Format::HEX_STRING},
+    {SAI_ACL_TABLE_ATTR_FIELD_VRF_ID, Format::HEX_STRING},
+    {SAI_ACL_TABLE_ATTR_FIELD_IPMC_NPU_META_DST_HIT, Format::HEX_STRING},
 };
 
 static const acl_table_attr_lookup_t aclCompositeMatchTableAttrLookup = {
@@ -589,6 +598,9 @@ static const acl_rule_attr_lookup_t aclMatchEntryAttrLookup = {
     {P4_MATCH_TUNNEL_VNI, SAI_ACL_ENTRY_ATTR_FIELD_TUNNEL_VNI},
     {P4_MATCH_IPV6_NEXT_HEADER, SAI_ACL_ENTRY_ATTR_FIELD_IPV6_NEXT_HEADER},
     {P4_MATCH_ROUTE_DST_USER_META, SAI_ACL_ENTRY_ATTR_FIELD_ROUTE_DST_USER_META},
+    {P4_MATCH_ACL_USER_META, SAI_ACL_ENTRY_ATTR_FIELD_ACL_USER_META},
+    {P4_MATCH_VRF_ID, SAI_ACL_ENTRY_ATTR_FIELD_VRF_ID},
+    {P4_MATCH_IPMC_TABLE_HIT, SAI_ACL_ENTRY_ATTR_FIELD_IPMC_NPU_META_DST_HIT},
 };
 
 static const acl_rule_attr_lookup_t aclCompositeMatchEntryAttrLookup = {

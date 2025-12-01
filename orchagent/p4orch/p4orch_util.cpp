@@ -1,6 +1,6 @@
-#include "p4orch/p4orch.h"
 #include "p4orch/p4orch_util.h"
 
+#include "p4orch/p4orch.h"
 #include "schema.h"
 
 using ::p4orch::kTableKeyDelimiter;
@@ -116,10 +116,20 @@ ActionInfo *getTableActionInfo(TableInfo *table, const std::string &action_name)
 
 std::string KeyGenerator::generateTablesInfoKey(const std::string &context)
 {
-    std::map<std::string, std::string> fv_map = {
-            {"context", context}
-    };
+    std::map<std::string, std::string> fv_map = {{"context", context}};
     return generateKey(fv_map);
+}
+
+void drainMgmtWithNotExecuted(std::deque<swss::KeyOpFieldsValuesTuple>& entries,
+                              ResponsePublisherInterface* publisher) {
+  for (const auto& key_op_fvs_tuple : entries) {
+    publisher->publish(APP_P4RT_TABLE_NAME, kfvKey(key_op_fvs_tuple),
+                       kfvFieldsValues(key_op_fvs_tuple),
+                       ReturnCode(StatusCode::SWSS_RC_NOT_EXECUTED),
+                       /*replace=*/true);
+  }
+  entries.clear();
+  return;
 }
 
 std::string KeyGenerator::generateRouteKey(const std::string &vrf_id, const swss::IpPrefix &ip_prefix)

@@ -14,6 +14,8 @@
 #include "schema.h"
 #include "warm_restart.h"
 
+#include "buffer/bufferschema.h"
+
 /*
  * Some Tips
  * 1. All keys in this file are in format of APPL_DB key.
@@ -852,8 +854,16 @@ void BufferMgrDynamic::checkSharedBufferPoolSize(bool force_update_during_initia
         }
     }
 
-    if (!m_mmuSize.empty())
+    // Execute recalculateSharedBufferPool when MMU size is available, and avoid extra recalculation in startup.
+    // Logic:
+    // - Non-warm start: execute as soon as MMU size is available.
+    // - Warm start: execute if buffer is completely initialized OR buffer pools are not ready.
+    if (!m_mmuSize.empty() &&
+        (!WarmStart::isWarmStart() ||
+         (WarmStart::isWarmStart() && (m_bufferCompletelyInitialized || !m_bufferPoolReady))))
+    {
         recalculateSharedBufferPool();
+    }
 }
 
 // For buffer pool, only size can be updated on-the-fly
@@ -896,6 +906,10 @@ void BufferMgrDynamic::updateBufferProfileToDb(const string &name, const buffer_
         }
         fvVector.emplace_back("xoff", profile.xoff);
     }
+    if (!profile.packet_discard_action.empty())
+    {
+        fvVector.emplace_back(BUFFER_PROFILE_PACKET_DISCARD_ACTION, profile.packet_discard_action);
+    }
     fvVector.emplace_back("size", profile.size);
     fvVector.emplace_back("pool", profile.pool_name);
     fvVector.emplace_back(mode, profile.threshold);
@@ -934,15 +948,6 @@ void BufferMgrDynamic::updateBufferObjectToDb(const string &key, const string &p
 void BufferMgrDynamic::updateBufferObjectListToDb(const string &key, const string &profileList, buffer_direction_t dir)
 {
     auto &table = m_applBufferProfileListTables[dir];
-    const auto &direction = m_bufferDirectionNames[dir];
-
-    if (!m_bufferPoolReady)
-    {
-        SWSS_LOG_NOTICE("Buffer pools are not ready when configuring buffer %s profile list %s, pending", direction.c_str(), key.c_str());
-        m_bufferObjectsPending = true;
-        return;
-    }
-
     vector<FieldValueTuple> fvVector;
 
     fvVector.emplace_back(buffer_profile_list_field_name, profileList);
@@ -1051,6 +1056,15 @@ bool BufferMgrDynamic::isHeadroomResourceValid(const string &port, const buffer_
     // profile: the profile referenced by the new_pg (if provided) or all PGs
     // new_pg: which pg is newly added?
 
+    // Skip headroom validation only during warm start while initialization is incomplete.
+    // - Non-warm start: never skip.
+    // - Warm start: skip only if initialization has not completed.
+    if (WarmStart::isWarmStart() &&
+        !m_bufferCompletelyInitialized)
+    {
+        return true;
+    }
+
     if (!profile.lossless && new_pg.empty())
     {
         SWSS_LOG_INFO("No need to check headroom for lossy PG port %s profile %s size %s without a PG specified",
@@ -1065,14 +1079,16 @@ bool BufferMgrDynamic::isHeadroomResourceValid(const string &port, const buffer_
 
     argv.emplace_back(profile.name);
     argv.emplace_back(profile.size);
+    argv.emplace_back(profile.xon);
+    argv.emplace_back(profile.xoff);
 
     if (!new_pg.empty())
     {
         argv.emplace_back(new_pg);
     }
 
-    SWSS_LOG_INFO("Checking headroom for port %s with profile %s size %s pg %s",
-                  port.c_str(), profile.name.c_str(), profile.size.c_str(), new_pg.c_str());
+    SWSS_LOG_INFO("Checking headroom for port %s with profile %s size %s xon %s xoff %s pg %s",
+                  port.c_str(), profile.name.c_str(), profile.size.c_str(), profile.xon.c_str(), profile.xoff.c_str(), new_pg.c_str());
 
     try
     {
@@ -1466,6 +1482,26 @@ task_process_status BufferMgrDynamic::refreshPgsForPort(const string &port, cons
             if (portInfo.state != PORT_READY)
             {
                 SWSS_LOG_INFO("Nothing to be done for %s since port is not ready", key.c_str());
+                continue;
+            }
+
+            // If cable len is 0m, remove lossless PG, keep lossy PG.
+            if (cable_length == "0m" && portPg.lossless)
+            {
+                if (oldProfile.empty())
+                {
+                    SWSS_LOG_INFO("No lossless profile found for port %s when cable length is set to '0m'.", port.c_str());
+                    continue;
+                }
+
+                if (m_bufferProfileLookup.find(oldProfile) != m_bufferProfileLookup.end())
+                {
+                    m_bufferProfileLookup[oldProfile].port_pgs.erase(key);
+                }
+
+                updateBufferObjectToDb(key, oldProfile, false);
+                profilesToBeReleased.insert(oldProfile);
+                portPg.running_profile_name.clear();
                 continue;
             }
 
@@ -2638,6 +2674,10 @@ task_process_status BufferMgrDynamic::handleBufferProfileTable(KeyOpFieldsValues
                     profileApp.direction = BUFFER_INGRESS;
                 }
             }
+            else if (field == BUFFER_PROFILE_PACKET_DISCARD_ACTION)
+            {
+                profileApp.packet_discard_action = value;
+            }
             SWSS_LOG_INFO("Inserting BUFFER_PROFILE table field %s value %s", field.c_str(), value.c_str());
         }
 
@@ -3243,6 +3283,15 @@ task_process_status BufferMgrDynamic::handleSingleBufferPortProfileListEntry(con
                 SWSS_LOG_ERROR("Unknown field %s in %s", fvField(i).c_str(), key.c_str());
                 continue;
             }
+        }
+
+        if (!m_bufferPoolReady)
+        {
+            const auto &direction = m_bufferDirectionNames[dir];
+
+            SWSS_LOG_NOTICE("Buffer pools are not ready when configuring buffer %s profile list %s, pending", direction.c_str(), key.c_str());
+            m_bufferObjectsPending = true;
+            return task_process_status::task_success;
         }
 
         auto &portInfo = m_portInfoLookup[port];

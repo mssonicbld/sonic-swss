@@ -9,7 +9,7 @@ from dvslib.dvs_common import PollingConfig
 def dynamic_buffer(dvs):
     buffer_model.enable_dynamic_buffer(dvs.get_config_db(), dvs.runcmd)
     yield
-    buffer_model.disable_dynamic_buffer(dvs.get_config_db(), dvs.runcmd)
+    buffer_model.disable_dynamic_buffer(dvs)
 
 @pytest.mark.usefixtures("dynamic_buffer")
 class TestBufferMgrDyn(object):
@@ -140,7 +140,7 @@ class TestBufferMgrDyn(object):
                                               'SAI_BUFFER_PROFILE_ATTR_POOL_ID': self.ingress_lossless_pool_oid,
                                               'SAI_BUFFER_PROFILE_ATTR_THRESHOLD_MODE': sai_threshold_mode,
                                               sai_threshold_name: sai_threshold_value},
-                                          self.DEFAULT_POLLING_CONFIG)
+                                          polling_config=self.DEFAULT_POLLING_CONFIG)
 
     def make_lossless_profile_name(self, speed, cable_length, mtu = None, dynamic_th = None):
         extra = ""
@@ -865,3 +865,112 @@ class TestBufferMgrDyn(object):
             dvs.port_admin_set('Ethernet0', 'down')
 
         self.cleanup_db(dvs)
+
+
+    def test_bufferPoolInitWithSHP(self, dvs, testlog):
+        self.setup_db(dvs)
+
+        try:
+            # 1. Enable the shared headroom pool
+            default_lossless_buffer_parameter = self.config_db.get_entry('DEFAULT_LOSSLESS_BUFFER_PARAMETER', 'AZURE')
+            default_lossless_buffer_parameter['over_subscribe_ratio'] = '2'
+            self.config_db.update_entry('DEFAULT_LOSSLESS_BUFFER_PARAMETER', 'AZURE', default_lossless_buffer_parameter)
+
+            # 2. Stop the orchagent
+            _, oa_pid = dvs.runcmd("pgrep orchagent")
+            dvs.runcmd("kill -s SIGSTOP {}".format(oa_pid))
+
+            # 3. Remove the size from CONFIG_DB|BUFFER_POOL.ingress_lossless_pool
+            original_ingress_lossless_pool = self.config_db.get_entry('BUFFER_POOL', 'ingress_lossless_pool')
+            try:
+                self.config_db.delete_field('BUFFER_POOL', 'ingress_lossless_pool', 'size')
+                self.config_db.delete_field('BUFFER_POOL', 'ingress_lossless_pool', 'xoff')
+            except Exception as e:
+                pass
+
+            # 4. Remove the ingress_lossless_pool from the APPL_DB
+            dvs.delete_entry_tbl(self.app_db.db_connection, 'BUFFER_POOL_TABLE', 'ingress_lossless_pool')
+
+            # 5. Mock it by adding a "TABLE_SET" entry to trigger the fallback logic
+            self.app_db.update_entry("BUFFER_PG_TABLE_SET", "", {"NULL": "NULL"})
+
+            # 6. Invoke the lua plugin
+            _, output = dvs.runcmd("redis-cli --eval /usr/share/swss/buffer_pool_vs.lua")
+            assert "ingress_lossless_pool:2048:1024" in output
+
+        finally:
+            self.config_db.update_entry('BUFFER_POOL', 'ingress_lossless_pool', original_ingress_lossless_pool)
+            self.config_db.delete_entry('DEFAULT_LOSSLESS_BUFFER_PARAMETER', 'AZURE')
+            dvs.delete_entry_tbl(self.app_db.db_connection, 'BUFFER_PG_TABLE_SET', '')
+            dvs.runcmd("kill -s SIGCONT {}".format(oa_pid))
+
+
+    def test_bufferPoolCalculation(self, dvs, testlog):
+        self.setup_db(dvs)
+
+        try:
+            self.config_db.delete_field('BUFFER_POOL', 'ingress_lossless_pool', 'size')
+        except Exception as e:
+            pass
+
+        try:
+            # Test 1: Test the buffer pool calculation with a percentage
+            percentage = 75
+            margin = 1
+
+            re_pool_size = "ingress_lossless_pool:([0-9]+)"
+            _, original_output = dvs.runcmd("redis-cli --eval /usr/share/swss/buffer_pool_vs.lua")
+            original_size = int(re.match(re_pool_size, original_output).group(1))
+
+            original_ingress_lossless_pool = self.config_db.get_entry('BUFFER_POOL', 'ingress_lossless_pool')
+            ingress_lossless_pool = original_ingress_lossless_pool
+            ingress_lossless_pool['percentage'] = str(percentage)
+            self.config_db.update_entry('BUFFER_POOL', 'ingress_lossless_pool', ingress_lossless_pool)
+
+            _, percentage_output = dvs.runcmd("redis-cli --eval /usr/share/swss/buffer_pool_vs.lua")
+            percentage_size = int(re.match(re_pool_size, percentage_output).group(1))
+
+            real_percentage = percentage_size * 100 / original_size
+            assert abs(percentage - real_percentage) < margin
+
+            # Test 2: Test the buffer pool calculation with a port with multiple queues
+            # Store existing Ethernet0 entries for restoration
+            original_eth0_entries = {}
+            eth0_keys = self.config_db.get_keys('BUFFER_QUEUE')
+            for key in eth0_keys:
+                if key.startswith('Ethernet0|'):
+                    original_eth0_entries[key] = self.config_db.get_entry('BUFFER_QUEUE', key)
+                    self.config_db.delete_entry('BUFFER_QUEUE', key)
+
+            # Startup port
+            dvs.port_admin_set('Ethernet0', 'up')
+
+            # Create buffer profile
+            self.config_db.update_entry('BUFFER_PROFILE', 'egress_test_profile',
+                                      {'dynamic_th': '0',
+                                       'pool': 'egress_lossy_pool',
+                                       'size': '16384'})
+
+            # Create buffer queue entries
+            self.config_db.update_entry('BUFFER_QUEUE', 'Ethernet0|0-7', {'profile': 'egress_test_profile'})
+            self.config_db.update_entry('BUFFER_QUEUE', 'Ethernet0|8-12', {'profile': 'egress_test_profile'})
+            self.config_db.update_entry('BUFFER_QUEUE', 'Ethernet0|13-19', {'profile': 'egress_test_profile'})
+
+            # Run lua script and check output
+            _, output = dvs.runcmd("redis-cli --eval /usr/share/swss/buffer_pool_vs.lua")
+            assert re.search(r"debug:BUFFER_PROFILE_TABLE:egress_test_profile:16384:20", output), "Profile reference count not found in output"
+
+        finally:
+            # Remove objects in reverse order
+            self.config_db.delete_entry('BUFFER_QUEUE', 'Ethernet0|13-19')
+            self.config_db.delete_entry('BUFFER_QUEUE', 'Ethernet0|8-12')
+            self.config_db.delete_entry('BUFFER_QUEUE', 'Ethernet0|0-7')
+            self.config_db.delete_entry('BUFFER_PROFILE', 'egress_test_profile')
+            dvs.port_admin_set('Ethernet0', 'down')
+
+            # Restore original Ethernet0 entries
+            for key, value in original_eth0_entries.items():
+                self.config_db.update_entry('BUFFER_QUEUE', key, value)
+
+            self.config_db.delete_entry('BUFFER_POOL', 'ingress_lossless_pool')
+            self.config_db.update_entry('BUFFER_POOL', 'ingress_lossless_pool', original_ingress_lossless_pool)

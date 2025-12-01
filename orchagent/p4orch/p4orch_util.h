@@ -1,22 +1,24 @@
 #pragma once
 
+#include <deque>
 #include <iomanip>
 #include <map>
 #include <set>
 #include <sstream>
 #include <string>
-#include <vector>
 #include <unordered_map>
+#include <vector>
 
 #include "ipaddress.h"
 #include "ipprefix.h"
 #include "macaddress.h"
+#include "response_publisher_interface.h"
+#include "return_code.h"
 #include "table.h"
 extern "C"
 {
 #include "saitypes.h"
 }
- 
 
 namespace p4orch
 {
@@ -110,55 +112,54 @@ std::string prependParamField(const std::string &str);
 
 struct ActionParamInfo
 {
-    std::string     name;
-    std::string     fieldtype;
-    std::string     datatype;
-    std::unordered_map<std::string, std::string>  table_reference_map;
+    std::string name;
+    std::string fieldtype;
+    std::string datatype;
+    std::unordered_map<std::string, std::string> table_reference_map;
 };
 
 struct ActionInfo
 {
-    std::string     name;
+    std::string name;
     std::unordered_map<std::string, ActionParamInfo> params;
-    bool            refers_to;
+    bool refers_to;
 };
 
 struct TableMatchInfo
 {
-    std::string        name;
-    std::string        fieldtype;
-    std::string        datatype;
-    std::unordered_map<std::string, std::string>  table_reference_map;
+    std::string name;
+    std::string fieldtype;
+    std::string datatype;
+    std::unordered_map<std::string, std::string> table_reference_map;
 };
 
 /**
- * Dervied table definition 
+ * Dervied table definition
  * This is a derived state out of table definition provided by P4RT-APP
  */
 struct TableInfo
 {
-    std::string                                      name;
-    int                                              id;
-    int                                              precedence;
-    std::unordered_map<std::string, TableMatchInfo>  match_fields;
-    std::unordered_map<std::string, ActionInfo>      action_fields;
-    bool                                             counter_bytes_enabled;
-    bool                                             counter_packets_enabled;
-    std::vector<std::string>                         action_ref_tables;
-                                                     // list of tables across all actions, of current table, refer to
+    std::string name;
+    int id;
+    int precedence;
+    std::unordered_map<std::string, TableMatchInfo> match_fields;
+    std::unordered_map<std::string, ActionInfo> action_fields;
+    bool counter_bytes_enabled;
+    bool counter_packets_enabled;
+    std::vector<std::string> action_ref_tables;
+    // list of tables across all actions, of current table, refer to
 };
 
 /**
  * table-name to table-definition map
  */
-typedef std::unordered_map<std::string, TableInfo>   TableInfoMap;
+typedef std::unordered_map<std::string, TableInfo> TableInfoMap;
 
 struct TablesInfoAppDbEntry
 {
     std::string context;
     std::string info;
 };
-
 
 struct P4RouterInterfaceAppDbEntry
 {
@@ -296,8 +297,8 @@ struct P4AclRuleAppDbEntry
 struct DepObject
 {
     sai_object_type_t sai_object;
-    std::string       key;
-    sai_object_id_t   oid;
+    std::string key;
+    sai_object_id_t oid;
 };
 
 struct P4ExtTableAppDbEntry
@@ -308,7 +309,6 @@ struct P4ExtTableAppDbEntry
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> action_params;
     std::unordered_map<std::string, DepObject> action_dep_objects;
 };
-
 
 TableInfo *getTableInfo(const std::string &table_name);
 ActionInfo *getTableActionInfo(TableInfo *table, const std::string &action_name);
@@ -332,6 +332,10 @@ void parseP4RTKey(const std::string &key, std::string *table_name, std::string *
 std::string verifyAttrs(const std::vector<swss::FieldValueTuple> &targets,
                         const std::vector<swss::FieldValueTuple> &exp, const std::vector<swss::FieldValueTuple> &opt,
                         bool allow_unknown);
+
+// Helper function to drain all entries in the manager without execution.
+void drainMgmtWithNotExecuted(std::deque<swss::KeyOpFieldsValuesTuple>& entries,
+                              ResponsePublisherInterface* publisher);
 
 // class KeyGenerator includes member functions to generate keys for entries
 // stored in P4 Orch managers.

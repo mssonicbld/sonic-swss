@@ -1,4 +1,6 @@
 #include "macsecorch.h"
+#include "macsecpost.h"
+#include "notifier.h"
 
 #include <macaddress.h>
 #include <sai_serialize.h>
@@ -38,6 +40,7 @@ extern sai_switch_api_t *sai_switch_api;
 constexpr bool DEFAULT_ENABLE_ENCRYPT = true;
 constexpr bool DEFAULT_SCI_IN_SECTAG = false;
 constexpr sai_macsec_cipher_suite_t DEFAULT_CIPHER_SUITE = SAI_MACSEC_CIPHER_SUITE_GCM_AES_128;
+bool saiAclFieldSciMatchSupported = true;
 
 static const std::vector<std::string> macsec_sa_attrs =
     {
@@ -598,6 +601,7 @@ MACsecOrch::MACsecOrch(
     const std::vector<std::string> &tables,
     PortsOrch *port_orch) : Orch(app_db, tables),
                             m_port_orch(port_orch),
+                            m_state_db(state_db),
                             m_state_macsec_port(state_db, STATE_MACSEC_PORT_TABLE_NAME),
                             m_state_macsec_egress_sc(state_db, STATE_MACSEC_EGRESS_SC_TABLE_NAME),
                             m_state_macsec_ingress_sc(state_db, STATE_MACSEC_INGRESS_SC_TABLE_NAME),
@@ -621,22 +625,80 @@ MACsecOrch::MACsecOrch(
                                 StatsMode::READ,
                                 MACSEC_STAT_POLLING_INTERVAL_MS, true),
                             m_gb_macsec_sa_attr_manager(
-                                "GB_FLEX_COUNTER_DB",
+                                true,
                                 COUNTERS_MACSEC_SA_ATTR_GROUP,
                                 StatsMode::READ,
                                 MACSEC_STAT_XPN_POLLING_INTERVAL_MS, true),
                             m_gb_macsec_sa_stat_manager(
-                                "GB_FLEX_COUNTER_DB",
+                                true,
                                 COUNTERS_MACSEC_SA_GROUP,
                                 StatsMode::READ,
                                 MACSEC_STAT_POLLING_INTERVAL_MS, true),
                             m_gb_macsec_flow_stat_manager(
-                                "GB_FLEX_COUNTER_DB",
+                                true,
                                 COUNTERS_MACSEC_FLOW_GROUP,
                                 StatsMode::READ,
                                 MACSEC_STAT_POLLING_INTERVAL_MS, true)
 {
     SWSS_LOG_ENTER();
+    sai_attr_capability_t capability;
+    if (sai_query_attribute_capability(gSwitchId, SAI_OBJECT_TYPE_ACL_TABLE,
+                                            SAI_ACL_TABLE_ATTR_FIELD_MACSEC_SCI,
+                                            &capability) == SAI_STATUS_SUCCESS)
+    {
+        if (capability.create_implemented == false)
+        {
+            SWSS_LOG_DEBUG("SAI_ACL_TABLE_ATTR_FIELD_MACSEC_SCI is not supported");
+            saiAclFieldSciMatchSupported = false;
+        }
+    }
+
+    // Add handler for POST completion callback/notification.
+    string post_state = getMacsecPostState(m_state_db);
+    if (post_state == "switch-level-post-in-progress" ||
+        post_state == "macsec-level-post-in-progress" )
+    {
+        m_notificationsDb = make_shared<DBConnector>("ASIC_DB", 0);
+        m_postCompletionNotificationConsumer = new swss::NotificationConsumer(m_notificationsDb.get(), "NOTIFICATIONS");
+        auto postCompletionNotificatier = new Notifier(m_postCompletionNotificationConsumer, this, "POST_COMPLETION__NOTIFICATIONS");
+        Orch::addExecutor(postCompletionNotificatier);
+    }
+
+    if (post_state == "switch-level-post-in-progress")
+    {
+        // POST was already enabled in switch init. The completion notification may have already been sent
+        // before MACSecOrch is initialized. So query if POST is completed or not. 
+        sai_attribute_t attr;
+        attr.id = SAI_SWITCH_ATTR_MACSEC_POST_STATUS;
+        if (sai_switch_api->get_switch_attribute(gSwitchId, 1, &attr) == SAI_STATUS_SUCCESS)
+        {
+            if (attr.value.s32 == SAI_SWITCH_MACSEC_POST_STATUS_PASS)
+            {
+                setMacsecPostState(m_state_db, "pass");
+                SWSS_LOG_NOTICE("Switch MACSec POST passed");
+            }
+            else if (attr.value.s32 == SAI_SWITCH_MACSEC_POST_STATUS_FAIL)
+            {
+                setMacsecPostState(m_state_db, "fail");
+                SWSS_LOG_ERROR("Switch MACSec POST failed: oid %" PRIu64, gSwitchId);
+            }
+            else
+            {
+                SWSS_LOG_NOTICE("Switch MACSec POST status: %d", attr.value.s32);
+            }
+        }
+        else
+        {
+            SWSS_LOG_ERROR("Failed to get MACSec POST status");
+        }
+    }
+    else if (post_state == "macsec-level-post-in-progress")
+    {
+        // POST is only supported in MACSec init. Create MACSec and enable POST.
+        m_enable_post = true;
+        initMACsecObject(gSwitchId);
+        SWSS_LOG_NOTICE("Init MACSec objects and enable POST");
+    }
 }
 
 MACsecOrch::~MACsecOrch()
@@ -646,6 +708,127 @@ MACsecOrch::~MACsecOrch()
         auto port = m_macsec_ports.begin();
         const MACsecOrch::TaskArgs temp;
         taskDisableMACsecPort(port->first, temp);
+    }
+}
+
+void MACsecOrch::doTask(NotificationConsumer &consumer)
+{
+    SWSS_LOG_ENTER();
+
+    if (&consumer != m_postCompletionNotificationConsumer)
+    {
+        return;
+    }
+
+    std::deque<KeyOpFieldsValuesTuple> entries;
+    consumer.pops(entries);
+    for (auto& entry : entries)
+    {
+        handleNotification(consumer, entry);
+    }
+}
+
+void MACsecOrch::handleNotification(NotificationConsumer &consumer, KeyOpFieldsValuesTuple& entry)
+{
+    SWSS_LOG_ENTER();
+
+    if (&consumer != m_postCompletionNotificationConsumer)
+    {
+        return;
+    }
+
+    auto op = kfvOp(entry);
+    auto data = kfvKey(entry);
+    SWSS_LOG_NOTICE("Received SAI notification: op %s, data %s", op.c_str(), data.c_str());
+
+    if (op == "switch_macsec_post_status")
+    {
+        sai_object_id_t switch_id;
+        sai_switch_macsec_post_status_t switch_macsec_post_status;
+        sai_deserialize_switch_macsec_post_status_ntf(data, switch_id, switch_macsec_post_status);
+
+        string post_state = getMacsecPostState(m_state_db);
+        if (post_state == "switch-level-post-in-progress")
+        {
+            // MACSec POST was enabled in switch init. SAI enables POST in all HW MACSec engines.
+            // The returned POST status is the aggregated result for all HW MACSec engines.
+
+            if (switch_macsec_post_status == SAI_SWITCH_MACSEC_POST_STATUS_PASS)
+            {
+                setMacsecPostState(m_state_db, "pass");
+                SWSS_LOG_NOTICE("Switch MACSec POST passed");
+            }
+            else if (switch_macsec_post_status == SAI_SWITCH_MACSEC_POST_STATUS_FAIL)
+            {
+                setMacsecPostState(m_state_db, "fail");
+                SWSS_LOG_ERROR("Switch MACSec POST failed");
+            }
+        }
+        else if (post_state == "macsec-level-post-in-progress")
+        {
+            SWSS_LOG_ERROR("POST enabled in MACSec init, but got notification from switch init");
+        }
+    }
+
+    if (op == "macsec_post_status")
+    {
+        sai_object_id_t macsec_id;
+        sai_macsec_post_status_t macsec_post_status;
+        sai_deserialize_macsec_post_status_ntf(data, macsec_id, macsec_post_status);
+
+        if (m_enable_post)
+        {
+            // MACSec POST was enabled in MACSec object init. Since two MACSec objects were created
+            // (one for each direction), two POST status must be returend from SAI. POST is considered
+            // pass only if POST passes in both MACSec objects.
+
+            string direction = "unknown";
+            auto macsec_obj = m_macsec_objs.find(gSwitchId);
+            if (macsec_obj->second.m_ingress_id == macsec_id)
+            {
+                direction = "ingress";
+            }
+            else if (macsec_obj->second.m_egress_id == macsec_id)
+            {
+                direction = "egress";
+            }
+
+            if (macsec_post_status == SAI_MACSEC_POST_STATUS_PASS)
+            {
+                if (direction == "ingress")
+                {
+                    SWSS_LOG_NOTICE("Ingress MACSec POST passed");
+                    macsec_obj->second.m_ingress_post_passed = true;
+                }
+                else if (direction == "egress")
+                {
+                    SWSS_LOG_NOTICE("Egress MACSec POST passed");
+                    macsec_obj->second.m_egress_post_passed = true;
+                }
+
+                // Check if POST passed on both MACSec objects.
+                if (macsec_obj->second.m_ingress_post_passed && macsec_obj->second.m_egress_post_passed)
+                {
+                    setMacsecPostState(m_state_db, "pass");
+                    SWSS_LOG_NOTICE("Ingress and egress MACSec POST passed");
+                }
+            }
+            else if(macsec_post_status == SAI_MACSEC_POST_STATUS_FAIL)
+            {
+                if (direction == "ingress")
+                {
+                    SWSS_LOG_ERROR("Ingress MACSec POST failed");
+                }
+                else if (direction == "egress")
+                {
+                    SWSS_LOG_ERROR("Egress MACSec POST failed");
+                }
+
+                // Consider POST failed since it failed on one MACSec object.
+                setMacsecPostState(m_state_db, "fail");
+                SWSS_LOG_ERROR("MACSec POST failed");
+            }
+        }
     }
 }
 
@@ -1032,6 +1215,13 @@ bool MACsecOrch::initMACsecObject(sai_object_id_t switch_id)
     attr.value.booldata = true;
     attrs.push_back(attr);
 
+    if (m_enable_post)
+    {
+        attr.id = SAI_MACSEC_ATTR_ENABLE_POST;
+        attr.value.booldata = true;
+        attrs.push_back(attr);
+    }
+
     sai_status_t status = sai_macsec_api->create_macsec(
                                 &macsec_obj.first->second.m_egress_id,
                                 switch_id,
@@ -1056,6 +1246,13 @@ bool MACsecOrch::initMACsecObject(sai_object_id_t switch_id)
     attr.id = SAI_MACSEC_ATTR_PHYSICAL_BYPASS_ENABLE;
     attr.value.booldata = true;
     attrs.push_back(attr);
+
+    if (m_enable_post)
+    {
+        attr.id = SAI_MACSEC_ATTR_ENABLE_POST;
+        attr.value.booldata = true;
+        attrs.push_back(attr);
+    }
 
     status = sai_macsec_api->create_macsec(
                                 &macsec_obj.first->second.m_ingress_id,
@@ -2352,16 +2549,16 @@ void MACsecOrch::installCounter(
     switch(counter_type)
     {
         case CounterType::MACSEC_SA_ATTR:
-            MACsecSaAttrStatManager(ctx).setCounterIdList(obj_id, counter_type, counter_stats);
+            MACsecSaAttrStatManager(ctx).setCounterIdList(obj_id, counter_type, counter_stats, *ctx.get_switch_id());
             break;
 
         case CounterType::MACSEC_SA:
-            MACsecSaStatManager(ctx).setCounterIdList(obj_id, counter_type, counter_stats);
+            MACsecSaStatManager(ctx).setCounterIdList(obj_id, counter_type, counter_stats, *ctx.get_switch_id());
             MACsecCountersMap(ctx).hset("", obj_name, sai_serialize_object_id(obj_id));
             break;
 
         case CounterType::MACSEC_FLOW:
-            MACsecFlowStatManager(ctx).setCounterIdList(obj_id, counter_type, counter_stats);
+            MACsecFlowStatManager(ctx).setCounterIdList(obj_id, counter_type, counter_stats, *ctx.get_switch_id());
             break;
 
         default:
@@ -2570,9 +2767,12 @@ bool MACsecOrch::createMACsecACLTable(
     attr.value.booldata = true;
     attrs.push_back(attr);
 
-    attr.id = SAI_ACL_TABLE_ATTR_FIELD_MACSEC_SCI;
-    attr.value.booldata = sci_in_sectag;
-    attrs.push_back(attr);
+    if (saiAclFieldSciMatchSupported == true)
+    {
+       attr.id = SAI_ACL_TABLE_ATTR_FIELD_MACSEC_SCI;
+       attr.value.booldata = sci_in_sectag;
+       attrs.push_back(attr);
+    }
 
     sai_status_t status = sai_acl_api->create_acl_table(
                                 &table_id,
@@ -2738,7 +2938,7 @@ bool MACsecOrch::createMACsecACLDataEntry(
     attr.value.aclaction.parameter.s32 = SAI_PACKET_ACTION_DROP;
     attr.value.aclaction.enable = true;
     attrs.push_back(attr);
-    if (sci_in_sectag)
+    if ((saiAclFieldSciMatchSupported == true) && sci_in_sectag)
     {
         attr.id = SAI_ACL_ENTRY_ATTR_FIELD_MACSEC_SCI;
         attr.value.aclfield.enable = true;

@@ -3,9 +3,9 @@ CFLAGS_SAI = -I /usr/include/sai
 LIBNL_CFLAGS = -I/usr/include/libnl3
 LIBNL_LIBS = -lnl-genl-3 -lnl-route-3 -lnl-3
 SAIMETA_LIBS = -lsaimeta -lsaimetadata -lzmq
-COMMON_LIBS = -lswsscommon
+COMMON_LIBS = -lswsscommon -lpthread
 
-bin_PROGRAMS = vlanmgrd teammgrd portmgrd intfmgrd buffermgrd vrfmgrd nbrmgrd vxlanmgrd sflowmgrd natmgrd coppmgrd tunnelmgrd macsecmgrd fabricmgrd
+bin_PROGRAMS = vlanmgrd teammgrd portmgrd intfmgrd buffermgrd vrfmgrd nbrmgrd vxlanmgrd sflowmgrd natmgrd coppmgrd tunnelmgrd macsecmgrd fabricmgrd stpmgrd
 
 cfgmgrdir = $(datadir)/swss
 
@@ -96,26 +96,33 @@ tunnelmgrd_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CF
 tunnelmgrd_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
 tunnelmgrd_LDADD = $(LDFLAGS_ASAN) $(COMMON_LIBS) $(SAIMETA_LIBS)
 
-macsecmgrd_SOURCES = macsecmgrd.cpp macsecmgr.cpp $(COMMON_ORCH_SOURCE) shellcmd.h
+macsecmgrd_SOURCES = macsecmgrd.cpp macsecmgr.cpp $(COMMON_ORCH_SOURCE) shellcmd.h $(top_srcdir)/orchagent/macsecpost.cpp
 macsecmgrd_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
 macsecmgrd_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
 macsecmgrd_LDADD = $(LDFLAGS_ASAN) $(COMMON_LIBS) $(SAIMETA_LIBS)
 
+
+stpmgrd_SOURCES = stpmgrd.cpp stpmgr.cpp $(COMMON_ORCH_SOURCE) shellcmd.h
+stpmgrd_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
+stpmgrd_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
+stpmgrd_LDADD = $(LDFLAGS_ASAN) $(COMMON_LIBS) $(SAIMETA_LIBS)
+
 if GCOV_ENABLED
-vlanmgrd_LDADD += -lgcovpreload
-teammgrd_LDADD += -lgcovpreload
-portmgrd_LDADD += -lgcovpreload
-intfmgrd_LDADD+= -lgcovpreload
-buffermgrd_LDADD += -lgcovpreload
-vrfmgrd_LDADD += -lgcovpreload
-nbrmgrd_LDADD += -lgcovpreload
-vxlanmgrd_LDADD += -lgcovpreload
-sflowmgrd_LDADD += -lgcovpreload
-natmgrd_LDADD += -lgcovpreload
-coppmgrd_LDADD += -lgcovpreload
-tunnelmgrd_LDADD += -lgcovpreload
-macsecmgrd_LDADD += -lgcovpreload
-fabricmgrd_LDADD += -lgcovpreload
+vlanmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
+teammgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
+portmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
+fabricmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
+intfmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
+buffermgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
+vrfmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
+nbrmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
+vxlanmgrd_SOURCES +=  ../gcovpreload/gcovpreload.cpp
+sflowmgrd_SOURCES +=  ../gcovpreload/gcovpreload.cpp
+natmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
+coppmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
+tunnelmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
+macsecmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
+stpmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
 endif
 
 if ASAN_ENABLED
@@ -133,5 +140,6 @@ coppmgrd_SOURCES += $(top_srcdir)/lib/asan.cpp
 tunnelmgrd_SOURCES += $(top_srcdir)/lib/asan.cpp
 macsecmgrd_SOURCES += $(top_srcdir)/lib/asan.cpp
 fabricmgrd_SOURCES += $(top_srcdir)/lib/asan.cpp
+stpmgrd_SOURCES += $(top_srcdir)/lib/asan.cpp
 endif
 

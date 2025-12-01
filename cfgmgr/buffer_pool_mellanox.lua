@@ -22,6 +22,7 @@ local total_port = 0
 
 local mgmt_pool_size = 256 * 1024
 local egress_mirror_headroom = 10 * 1024
+local modification_descriptors_pool_size = 0
 
 -- The set of ports with 8 lanes
 local port_set_8lanes = {}
@@ -69,7 +70,9 @@ local function iterate_all_items(all_items, check_lossless)
             if string.len(range) == 1 then
                 size = 1
             else
-                size = 1 + tonumber(string.sub(range, -1)) - tonumber(string.sub(range, 1, 1))
+                -- Extract start and end numbers from the range (e.g., "8-15")
+                local start_num, end_num = string.match(range, "(%d+)-(%d+)")
+                size = tonumber(end_num) - tonumber(start_num) + 1
             end
             profiles[profile_name] = profile_ref_count + size
             if port_set_8lanes[port] and ingress_profile_is_lossless[profile_name] == false then
@@ -133,7 +136,7 @@ local function iterate_profile_list(all_items)
     return 0
 end
 
-local function fetch_buffer_pool_size_from_appldb()
+local function fetch_buffer_pool_size_from_appldb(shp_enabled)
     local buffer_pools = {}
     redis.call('SELECT', config_db)
     local buffer_pool_keys = redis.call('KEYS', 'BUFFER_POOL|*')
@@ -158,7 +161,22 @@ local function fetch_buffer_pool_size_from_appldb()
         end
         xoff = redis.call('HGET', 'BUFFER_POOL_TABLE:' .. buffer_pools[i], 'xoff')
         if not xoff then
-            table.insert(result, buffer_pools[i] .. ':' .. size)
+            if shp_enabled and size == "0" and buffer_pools[i] == "ingress_lossless_pool" then
+                -- During initialization, if SHP is enabled
+                --   1. the buffer pool sizes, xoff have initialized to 0, which means the shared headroom pool is disabled
+                --   2. but the buffer profiles already indicate the shared headroom pool is enabled
+                --   3. later on the buffer pool sizes are updated with xoff being non-zero
+                -- In case the orchagent starts handling buffer configuration between 2 and 3,
+                -- It is inconsistent between buffer pools and profiles, which fails Mellanox SAI sanity check
+                -- To avoid it, it indicates the shared headroom pool is enabled by setting a very small buffer pool and shared headroom pool sizes
+                if size == "0" then
+                    table.insert(result, buffer_pools[i] .. ':2048:1024')
+                else
+                    table.insert(result, buffer_pools[i] .. ":" .. size .. ':1024')
+                end
+            else
+                table.insert(result, buffer_pools[i] .. ':' .. size)
+            end
         else
             table.insert(result, buffer_pools[i] .. ':' .. size .. ':' .. xoff)
         end
@@ -168,6 +186,23 @@ end
 -- Main --
 -- Connect to CONFIG_DB
 redis.call('SELECT', config_db)
+
+-- Check if platform is SPC6 or later and set modification descriptors pool size
+-- Extract model number from platform string (e.g., "sn6600" -> 6600, "sn5800" -> 5800, "sn10600" -> 10600)
+-- Use (%d+) pattern to capture one or more digits for extensibility (handles future multi-digit series like sn10xxx, sn11xxx)
+local platform = redis.call('HGET', 'DEVICE_METADATA|localhost', 'platform')
+if platform then
+    local model_str = string.match(platform, "sn(%d+)")
+    if model_str then
+        local model_number = tonumber(model_str)
+        -- SPC6 or later models (>= 6000 excludes SPC5 models like 5400/5800, includes SPC6+ like 6600/7xxx/10xxx)
+        -- Reserve 32MB for modification descriptors pool
+        if model_number and model_number >= 6000 then
+            modification_descriptors_pool_size = 32 * 1024 * 1024
+            egress_mirror_headroom  = 0
+        end
+    end
+end
 
 -- Parse all the pools and seperate them according to the direction
 local ipools = {}
@@ -295,7 +330,7 @@ local fail_count = 0
 fail_count = fail_count + iterate_all_items(all_pgs, true)
 fail_count = fail_count + iterate_all_items(all_tcs, false)
 if fail_count > 0 then
-    fetch_buffer_pool_size_from_appldb()
+    fetch_buffer_pool_size_from_appldb(shp_enabled)
     return result
 end
 
@@ -305,7 +340,7 @@ local all_egress_profile_lists = redis.call('KEYS', 'BUFFER_PORT_EGRESS_PROFILE_
 fail_count = fail_count + iterate_profile_list(all_ingress_profile_lists)
 fail_count = fail_count + iterate_profile_list(all_egress_profile_lists)
 if fail_count > 0 then
-    fetch_buffer_pool_size_from_appldb()
+    fetch_buffer_pool_size_from_appldb(shp_enabled)
     return result
 end
 
@@ -367,7 +402,7 @@ accumulative_occupied_buffer = accumulative_occupied_buffer + accumulative_manag
 
 -- Accumulate sizes for egress mirror and management pool
 local accumulative_egress_mirror_overhead = admin_up_port * egress_mirror_headroom
-accumulative_occupied_buffer = accumulative_occupied_buffer + accumulative_egress_mirror_overhead + mgmt_pool_size
+accumulative_occupied_buffer = accumulative_occupied_buffer + accumulative_egress_mirror_overhead + mgmt_pool_size + modification_descriptors_pool_size
 
 -- Switch to CONFIG_DB
 redis.call('SELECT', config_db)
@@ -406,10 +441,12 @@ local pool_size
 if shp_size then
     accumulative_occupied_buffer = accumulative_occupied_buffer + shp_size
 end
+
+local available_buffer = mmu_size - accumulative_occupied_buffer
 if ingress_pool_count == 1 then
-    pool_size = mmu_size - accumulative_occupied_buffer
+    pool_size = available_buffer
 else
-    pool_size = (mmu_size - accumulative_occupied_buffer) / 2
+    pool_size = available_buffer / 2
 end
 
 if pool_size > ceiling_mmu_size then
@@ -418,12 +455,19 @@ end
 
 local shp_deployed = false
 for i = 1, #pools_need_update, 1 do
+    local percentage = tonumber(redis.call('HGET', pools_need_update[i], 'percentage'))
+    local effective_pool_size
+    if percentage ~= nil and percentage >= 0 then
+        effective_pool_size = available_buffer * percentage / 100
+    else
+        effective_pool_size = pool_size
+    end
     local pool_name = string.match(pools_need_update[i], "BUFFER_POOL|([^%s]+)$")
     if shp_size ~= 0 and pool_name == "ingress_lossless_pool" then
-        table.insert(result, pool_name .. ":" .. math.ceil(pool_size) .. ":" .. math.ceil(shp_size))
+        table.insert(result, pool_name .. ":" .. math.ceil(effective_pool_size) .. ":" .. math.ceil(shp_size))
         shp_deployed = true
     else
-        table.insert(result, pool_name .. ":" .. math.ceil(pool_size))
+        table.insert(result, pool_name .. ":" .. math.ceil(effective_pool_size))
     end
 end
 
@@ -449,5 +493,6 @@ table.insert(result, "debug:shp_enabled:" .. tostring(shp_enabled))
 table.insert(result, "debug:shp_size:" .. shp_size)
 table.insert(result, "debug:total port:" .. total_port .. " ports with 8 lanes:" .. port_count_8lanes)
 table.insert(result, "debug:admin up port:" .. admin_up_port .. " admin up ports with 8 lanes:" .. admin_up_8lanes_port)
+table.insert(result, "debug:modification_descriptors_pool_size:" .. modification_descriptors_pool_size)
 
 return result

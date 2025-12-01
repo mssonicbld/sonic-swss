@@ -192,7 +192,10 @@ void MclagLink::setPortIsolate(char *msg)
     static const unordered_set<string> supported {
         BRCM_PLATFORM_SUBSTRING,
         BFN_PLATFORM_SUBSTRING,
-        CTC_PLATFORM_SUBSTRING
+        CTC_PLATFORM_SUBSTRING,
+        CLX_PLATFORM_SUBSTRING,
+        MRVL_PRST_PLATFORM_SUBSTRING,
+        MRVL_TL_PLATFORM_SUBSTRING
     };
 
     const char *platform = getenv("platform");
@@ -1843,7 +1846,7 @@ MclagLink::~MclagLink()
 void MclagLink::accept()
 {
     struct sockaddr_in client_addr;
-    socklen_t client_len;
+    socklen_t client_len = sizeof(struct sockaddr_in);
 
     m_connection_socket = ::accept(m_server_socket, (struct sockaddr *)&client_addr,
             &client_len);

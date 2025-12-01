@@ -10,6 +10,7 @@
 #include "tunneldecaporch.h"
 #include "aclorch.h"
 #include "neighorch.h"
+#include "bulker.h"
 
 enum MuxState
 {
@@ -34,6 +35,26 @@ enum MuxCableType
     ACTIVE_STANDBY,
     ACTIVE_ACTIVE
 };
+
+struct MuxRouteBulkContext
+{
+    std::deque<sai_status_t>            object_statuses;            // Bulk statuses
+    IpPrefix                            pfx;                        // Route prefix
+    sai_object_id_t                     nh;                         // nexthop id
+
+    MuxRouteBulkContext(IpPrefix pfx)
+        : pfx(pfx)
+    {
+    }
+
+    MuxRouteBulkContext(IpPrefix pfx, sai_object_id_t nh)
+        : pfx(pfx), nh(nh)
+    {
+    }
+};
+
+extern size_t gMaxBulkSize;
+extern sai_route_api_t* sai_route_api;
 
 // Forward Declarations
 class MuxOrch;
@@ -64,7 +85,7 @@ typedef std::map<IpAddress, sai_object_id_t> MuxNeighbor;
 class MuxNbrHandler
 {
 public:
-    MuxNbrHandler() = default;
+    MuxNbrHandler() : gRouteBulker(sai_route_api, gMaxBulkSize) {};
 
     bool enable(bool update_rt);
     bool disable(sai_object_id_t);
@@ -73,13 +94,18 @@ public:
     sai_object_id_t getNextHopId(const NextHopKey);
     MuxNeighbor getNeighbors() const { return neighbors_; };
     string getAlias() const { return alias_; };
+    void clearBulkers() { gRouteBulker.clear(); };
 
 private:
+    bool removeRoutes(std::list<MuxRouteBulkContext>& bulk_ctx_list);
+    bool addRoutes(std::list<MuxRouteBulkContext>& bulk_ctx_list);
+
     inline void updateTunnelRoute(NextHopKey, bool = true);
 
 private:
     MuxNeighbor neighbors_;
     string alias_;
+    EntityBulker<sai_route_api_t> gRouteBulker;
 };
 
 // Mux Cable object
@@ -105,6 +131,7 @@ public:
     bool isIpInSubnet(IpAddress ip);
     void updateNeighbor(NextHopKey nh, bool add);
     void updateRoutes();
+    void updateRoutesForNextHop(NextHopKey nh);
     sai_object_id_t getNextHopId(const NextHopKey nh)
     {
         return nbr_handler_->getNextHopId(nh);
@@ -148,6 +175,7 @@ const request_description_t mux_cfg_request_description = {
                 { "soc_ipv4", REQ_T_IP_PREFIX },
                 { "soc_ipv6", REQ_T_IP_PREFIX },
                 { "cable_type", REQ_T_STRING },
+                { "prober_type", REQ_T_STRING },
             },
             { }
 };
@@ -194,11 +222,6 @@ public:
         return (skip_neighbors_.find(nbr) != skip_neighbors_.end());
     }
 
-    bool isMultiNexthopRoute(const IpPrefix& pfx)
-    {
-        return (mux_multi_active_nh_table.find(pfx) != mux_multi_active_nh_table.end());
-    }
-
     MuxCable* findMuxCableInSubnet(IpAddress);
     bool isNeighborActive(const IpAddress&, const MacAddress&, string&);
     void update(SubjectType, void *);
@@ -213,9 +236,21 @@ public:
     sai_object_id_t createNextHopTunnel(std::string tunnelKey, IpAddress& ipAddr);
     bool removeNextHopTunnel(std::string tunnelKey, IpAddress& ipAddr);
     sai_object_id_t getNextHopTunnelId(std::string tunnelKey, IpAddress& ipAddr);
+    sai_object_id_t getTunnelNextHopId();
 
-    void updateRoute(const IpPrefix &pfx, bool add);
+    void updateRoute(const IpPrefix &pfx);
     bool isStandaloneTunnelRouteInstalled(const IpAddress& neighborIp);
+
+    void enableCachingNeighborUpdate()
+    {
+        enable_cache_neigh_updates_ = true;
+    }
+    void disableCachingNeighborUpdate()
+    {
+        enable_cache_neigh_updates_ = false;
+    }
+    void updateCachedNeighbors();
+    bool getMuxPort(const MacAddress&, const string&, string&);
 
 private:
     virtual bool addOperation(const Request& request);
@@ -226,8 +261,6 @@ private:
 
     void updateNeighbor(const NeighborUpdate&);
     void updateFdb(const FdbUpdate&);
-
-    bool getMuxPort(const MacAddress&, const string&, string&);
 
     /***
      * Methods for managing tunnel routes for neighbor IPs not associated
@@ -256,9 +289,6 @@ private:
     MuxTunnelNHs mux_tunnel_nh_;
     NextHopTb mux_nexthop_tb_;
 
-    /* contains reference of programmed routes by updateRoute */
-    MuxRouteTb mux_multi_active_nh_table;
-
     handler_map handler_map_;
 
     TunnelDecapOrch *decap_orch_;
@@ -268,6 +298,9 @@ private:
     MuxCfgRequest request_;
     std::set<IpAddress> standalone_tunnel_neighbors_;
     std::set<IpAddress> skip_neighbors_;
+
+    bool enable_cache_neigh_updates_ = false;
+    std::vector<NeighborUpdate> cached_neigh_updates_;
 };
 
 const request_description_t mux_cable_request_description = {
